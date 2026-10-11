@@ -421,11 +421,12 @@ def _digits(value: str | None) -> str | None:
     return "".join(character for character in value if character.isdigit())
 
 class AssinarIn(BaseModel):
-    plano:          str          # starter | professional
-    asaasCustomerId: str         # cus_xxx criado previamente no Asaas
-    creditCard:     CreditCardIn
-    holderInfo:     HolderInfoIn
-    remoteIp:       str = "127.0.0.1"
+    plano:           str
+    periodicidade:   str = "mensal"   # mensal | trimestral
+    asaasCustomerId: str
+    creditCard:      CreditCardIn
+    holderInfo:      HolderInfoIn
+    remoteIp:        str = "127.0.0.1"
 
 class AssinarOut(BaseModel):
     subscriptionId: str
@@ -433,6 +434,16 @@ class AssinarOut(BaseModel):
     status:         str
     nextDueDate:    str
     value:          float
+
+class AssinarOut(BaseModel):
+    subscriptionId: str
+    plano:          str
+    periodicidade:  str
+    status:         str
+    nextDueDate:    str
+    value:          float
+    valorMensal:    float
+    desconto:       float
 
 @app.post("/k1/lex/auth/assinar", response_model=AssinarOut)
 def assinar(body: AssinarIn, db: Session = Depends(get_db), payload=Depends(verify_token)):
@@ -452,68 +463,132 @@ def assinar(body: AssinarIn, db: Session = Depends(get_db), payload=Depends(veri
     if tenant.asaas_subscription_id and tenant.subscription_status in ("pending", "active", "past_due"):
         raise HTTPException(409, "Ja existe uma assinatura vinculada a esta conta")
 
-    # Calcula nextDueDate: se ainda em trial, agenda para o fim do trial
+    periodicidade = getattr(body, "periodicidade", "mensal") or "mensal"
+    meses = 3 if periodicidade == "trimestral" else 1
+    desconto = plano_cfg["value"] * meses * 0.05 if periodicidade == "trimestral" else 0.0
+    valor_total = round(plano_cfg["value"] * meses - desconto, 2)
+    cycle = "QUARTERLY" if periodicidade == "trimestral" else "MONTHLY"
+
     now = datetime.utcnow()
     if tenant.plano == "trial" and tenant.trial_expires_at and tenant.trial_expires_at > now:
         next_due = tenant.trial_expires_at.strftime("%Y-%m-%d")
     else:
-        next_due = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+        next_due = now.strftime("%Y-%m-%d")
 
-    payload_asaas = {
+    headers = {
+        "access_token": KEALEX_ASAAS_API_KEY,
+        "Content-Type": "application/json",
+        "User-Agent": "Kealex/1.0.0",
+    }
+
+    # 1. Cobrar o primeiro pagamento via POST /payments com cartao
+    payment_payload = {
         "customer":    body.asaasCustomerId,
         "billingType": "CREDIT_CARD",
-        "nextDueDate": next_due,
-        "value":       plano_cfg["value"],
-        "cycle":       "MONTHLY",
+        "dueDate":     next_due,
+        "value":       valor_total,
         "description": plano_cfg["description"],
         "creditCard": {
             "holderName":  body.creditCard.holderName,
-            "number":      body.creditCard.number,
+            "number":      body.creditCard.number.replace(" ", ""),
             "expiryMonth": body.creditCard.expiryMonth,
             "expiryYear":  body.creditCard.expiryYear,
             "ccv":         body.creditCard.ccv,
         },
         "creditCardHolderInfo": {
-            "name":               body.holderInfo.name,
-            "email":              body.holderInfo.email,
-            "cpfCnpj":            _digits(body.holderInfo.cpfCnpj),
-            "postalCode":         body.holderInfo.postalCode,
-            "addressNumber":      body.holderInfo.addressNumber,
-            "addressComplement":  body.holderInfo.addressComplement,
-            "phone":              _digits(body.holderInfo.phone),
-            "mobilePhone":        _digits(body.holderInfo.mobilePhone),
+            "name":              body.holderInfo.name,
+            "email":             body.holderInfo.email,
+            "cpfCnpj":           _digits(body.holderInfo.cpfCnpj),
+            "postalCode":        _digits(body.holderInfo.postalCode),
+            "addressNumber":     body.holderInfo.addressNumber,
+            "addressComplement": body.holderInfo.addressComplement,
+            "phone":             _digits(body.holderInfo.phone),
+            "mobilePhone":       _digits(body.holderInfo.mobilePhone),
         },
         "remoteIp": body.remoteIp,
     }
 
     try:
         resp = httpx.post(
-            f"{ASAAS_BASE}/subscriptions",
-            json=payload_asaas,
-            headers={"access_token": KEALEX_ASAAS_API_KEY, "Content-Type": "application/json"},
-            timeout=20,
+            f"{ASAAS_BASE}/payments",
+            json=payment_payload,
+            headers=headers,
+            timeout=30,
         )
         if resp.status_code not in (200, 201):
             detail = resp.json().get("errors", resp.text)
-            raise HTTPException(422, f"Asaas recusou: {detail}")
-        data = resp.json()
+            raise HTTPException(422, f"Asaas recusou o pagamento: {detail}")
+        payment_data = resp.json()
     except httpx.TimeoutException:
         raise HTTPException(504, "Timeout ao conectar com Asaas")
 
-    # A criacao nao prova que a primeira cobranca foi liquidada.
-    tenant.asaas_subscription_id = data.get("id")
+    payment_status = (payment_data.get("status") or "").upper()
+    payment_id = payment_data.get("id", "")
+
+    # 2. Se aprovado, criar assinatura recorrente (sem dados de cartao — Asaas tokeniza)
+    subscription_id = ""
+    if payment_status in ("CONFIRMED", "RECEIVED"):
+        try:
+            sub_resp = httpx.post(
+                f"{ASAAS_BASE}/subscriptions",
+                json={
+                    "customer":    body.asaasCustomerId,
+                    "billingType": "CREDIT_CARD",
+                    "nextDueDate": next_due,
+                    "value":       valor_total,
+                    "cycle":       cycle,
+                    "description": plano_cfg["description"],
+                    "creditCard": {
+                        "holderName":  body.creditCard.holderName,
+                        "number":      body.creditCard.number.replace(" ", ""),
+                        "expiryMonth": body.creditCard.expiryMonth,
+                        "expiryYear":  body.creditCard.expiryYear,
+                        "ccv":         body.creditCard.ccv,
+                    },
+                    "creditCardHolderInfo": {
+                        "name":              body.holderInfo.name,
+                        "email":             body.holderInfo.email,
+                        "cpfCnpj":           _digits(body.holderInfo.cpfCnpj),
+                        "postalCode":        _digits(body.holderInfo.postalCode),
+                        "addressNumber":     body.holderInfo.addressNumber,
+                        "addressComplement": body.holderInfo.addressComplement,
+                        "phone":             _digits(body.holderInfo.phone),
+                        "mobilePhone":       _digits(body.holderInfo.mobilePhone),
+                    },
+                    "remoteIp": body.remoteIp,
+                },
+                headers=headers,
+                timeout=20,
+            )
+            if sub_resp.status_code in (200, 201):
+                subscription_id = sub_resp.json().get("id", "")
+        except httpx.TimeoutException:
+            pass  # pagamento ja confirmado; assinatura pode ser criada depois via webhook
+
+    # 3. Persiste estado no banco
+    if payment_status in ("CONFIRMED", "RECEIVED"):
+        tenant.subscription_status = "active"
+        tenant.plano = body.plano
+        tenant.ativo = True
+        db.query(Usuario).filter_by(tenant_id=tenant.id).update({"ativo": True})
+    else:
+        tenant.subscription_status = "pending"
+
+    tenant.asaas_subscription_id = subscription_id or payment_id
     tenant.subscription_plan = body.plano
-    tenant.subscription_status = "pending"
-    tenant.next_due_date = data.get("nextDueDate", next_due)
+    tenant.next_due_date = payment_data.get("dueDate", next_due)
     tenant.updated_at = datetime.utcnow()
     db.commit()
 
     return AssinarOut(
-        subscriptionId=data.get("id", ""),
+        subscriptionId=subscription_id or payment_id,
         plano=body.plano,
-        status="PENDING_PAYMENT",
-        nextDueDate=data.get("nextDueDate", next_due),
-        value=plano_cfg["value"],
+        periodicidade=periodicidade,
+        status=payment_status or "PENDING",
+        nextDueDate=payment_data.get("dueDate", next_due),
+        value=valor_total,
+        valorMensal=plano_cfg["value"],
+        desconto=desconto,
     )
 
 
@@ -767,6 +842,73 @@ def billing_status(db: Session = Depends(get_db), payload=Depends(verify_token))
         "subscriptionStatus": tenant.subscription_status,
         "nextDueDate": tenant.next_due_date,
         "trialExpiresAt": tenant.trial_expires_at.isoformat() if tenant.trial_expires_at else None,
+    }
+
+
+@app.get("/k1/lex/auth/assinatura")
+def get_assinatura(db: Session = Depends(get_db), payload=Depends(verify_token)):
+    tenant = db.query(Tenant).filter_by(id=payload.get("tenant_id")).first()
+    if not tenant or not tenant.asaas_subscription_id:
+        raise HTTPException(404, "Nenhuma assinatura encontrada")
+
+    periodicidade = "mensal"
+    pix_qr_code = None
+    pix_key = None
+    pix_expires_at = None
+
+    # Tenta buscar detalhes atualizados no Asaas
+    try:
+        headers = {"access_token": KEALEX_ASAAS_API_KEY, "User-Agent": "Kealex/1.0.0"}
+        resp = httpx.get(
+            f"{ASAAS_BASE}/subscriptions/{tenant.asaas_subscription_id}",
+            headers=headers,
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            sub = resp.json()
+            cycle = (sub.get("cycle") or "").upper()
+            periodicidade = "trimestral" if cycle == "QUARTERLY" else "mensal"
+
+        # Se pendente, tenta buscar QR Code do pagamento mais recente
+        if tenant.subscription_status == "pending":
+            pay_resp = httpx.get(
+                f"{ASAAS_BASE}/payments",
+                params={"subscription": tenant.asaas_subscription_id, "limit": 1},
+                headers=headers,
+                timeout=10,
+            )
+            if pay_resp.status_code == 200:
+                payments = pay_resp.json().get("data", [])
+                if payments:
+                    payment = payments[0]
+                    billing_type = (payment.get("billingType") or "").upper()
+                    if billing_type == "PIX":
+                        qr_resp = httpx.get(
+                            f"{ASAAS_BASE}/payments/{payment['id']}/pixQrCode",
+                            headers=headers,
+                            timeout=10,
+                        )
+                        if qr_resp.status_code == 200:
+                            qr = qr_resp.json()
+                            pix_qr_code = qr.get("encodedImage")
+                            pix_key = qr.get("payload")
+                            pix_expires_at = qr.get("expirationDate")
+    except httpx.TimeoutException:
+        pass
+
+    plano_cfg = PLANOS.get(tenant.subscription_plan or tenant.plano, {})
+    return {
+        "subscriptionId": tenant.asaas_subscription_id,
+        "plano": tenant.subscription_plan or tenant.plano,
+        "periodicidade": periodicidade,
+        "valor": plano_cfg.get("value", 0),
+        "status": tenant.plano,
+        "subscriptionStatus": tenant.subscription_status or "pending",
+        "createdAt": tenant.created_at.isoformat() if tenant.created_at else None,
+        "nextDueDate": tenant.next_due_date,
+        "pixQrCode": pix_qr_code,
+        "pixKey": pix_key,
+        "pixExpiresAt": pix_expires_at,
     }
 @app.get("/health")
 def health_simple():
