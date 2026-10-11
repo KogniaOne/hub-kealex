@@ -1,11 +1,12 @@
 import os, uuid, enum, sys
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Literal
 import logging
+import httpx
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from jose import jwt, JWTError
 from sqlalchemy import create_engine, Column, String, DateTime, Text, Integer
 from sqlalchemy.engine import URL, make_url
@@ -124,11 +125,22 @@ def health():
 # Alias: suporte a /k1/lex/cobrancas (legado) e /cobrancas (via stripprefix /v1/lex)
 PREFIX = "/cobrancas"
 
+ASAAS_API_KEY = os.getenv("ASAAS_API_KEY", "")
+ASSAS_BASE_URL = os.getenv("ASAAS_BASE_URL", "https://api-sandbox.asaas.com/v3")
+
 class CobrancaIn(BaseModel):
     processoId: str
     clienteId: str
     valorCentavos: int
     dataVencimento: Optional[str] = None
+
+class PagamentoIn(BaseModel):
+    cobrancaId: str
+    billingType: Literal["CREDIT_CARD", "PIX"]
+    customer: str
+    value: float
+    dueDate: str
+    description: Optional[str] = None
 
 def _cobranca_to_dict(cobranca: Cobranca):
     fases_cobranca = ["Pendente", "Aguardando Pagamento", "Vencida", "Em Cobranca", "Pago"]
@@ -366,6 +378,76 @@ def cancelar_cobranca(body: dict, db: Session = Depends(get_db), payload=Depends
         logger.error(f"[CANCELAR] ERRO: {str(e)}", exc_info=True)
         db.rollback()
         raise HTTPException(500, f"Erro ao cancelar cobranca: {str(e)}")
+
+@app.post("/v1/lex/cobrancas/pagamento")
+@app.post("/k1/lex/cobrancas/pagamento")
+@app.post(f"{PREFIX}/pagamento", include_in_schema=False)
+def criar_pagamento(body: PagamentoIn, db: Session = Depends(get_db), payload=Depends(_guard)):
+    tenant_id = payload.get("tenant_id")
+    cobranca = db.query(Cobranca).filter_by(id=body.cobrancaId, tenant_id=tenant_id).first()
+    if not cobranca:
+        raise HTTPException(404, "Cobranca nao encontrada")
+    if cobranca.status in ("pago", "cancelado"):
+        raise HTTPException(400, f"Cobranca com status '{cobranca.status}' nao pode ser paga")
+
+    if not ASAAS_API_KEY:
+        raise HTTPException(500, "ASAAS_API_KEY nao configurada")
+
+    payload_asaas = {
+        "billingType": body.billingType,
+        "customer": body.customer,
+        "value": body.value,
+        "dueDate": body.dueDate,
+        "description": body.description or f"Cobranca {body.cobrancaId}",
+    }
+
+    try:
+        with httpx.Client(timeout=15) as client:
+            resp = client.post(
+                f"{ASSAS_BASE_URL}/payments",
+                json=payload_asaas,
+                headers={
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                    "access_token": ASAAS_API_KEY,
+                    "User-Agent": "HubKealex/1.0.0",
+                },
+            )
+    except httpx.RequestError as e:
+        logger.error(f"[PAGAMENTO] Erro ao conectar Asaas: {e}")
+        raise HTTPException(502, "Erro ao conectar com gateway de pagamento")
+
+    if resp.status_code not in (200, 201):
+        logger.error(f"[PAGAMENTO] Asaas retornou {resp.status_code}: {resp.text}")
+        raise HTTPException(resp.status_code, f"Erro no gateway de pagamento: {resp.text}")
+
+    asaas_data = resp.json()
+
+    cobranca.status = "aguardando_pagamento"
+    cobranca.updated_at = datetime.utcnow()
+    db.add(cobranca)
+
+    historico = HistoricoCobranca(
+        id=str(uuid.uuid4()),
+        cobranca_id=cobranca.id,
+        acao="pagamento_iniciado",
+        status_anterior=cobranca.status,
+        status_novo="aguardando_pagamento",
+        observacao=f"billingType={body.billingType}, asaas_id={asaas_data.get('id')}",
+    )
+    db.add(historico)
+    db.commit()
+
+    logger.info(f"[PAGAMENTO] Pagamento criado no Asaas: {asaas_data.get('id')}")
+    return {
+        "cobrancaId": cobranca.id,
+        "asaasId": asaas_data.get("id"),
+        "billingType": asaas_data.get("billingType"),
+        "status": asaas_data.get("status"),
+        "invoiceUrl": asaas_data.get("invoiceUrl"),
+        "pixQrCodeUrl": asaas_data.get("pixQrCodeUrl"),
+        "bankSlipUrl": asaas_data.get("bankSlipUrl"),
+    }
 
 @app.post("/v1/lex/cobrancas/timeline")
 @app.post("/k1/lex/cobrancas/timeline")
